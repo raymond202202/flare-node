@@ -310,7 +310,8 @@ export class Agent {
       ? envMax
       : (this.config.maxIterations || DEFAULT_MAX_ITERATIONS)
     const maxIter = Math.max(1, Math.min(configuredMax, HARD_MAX_ITERATIONS))
-    let noProgressCount = 0 // 连续无文本输出的工具调用次数
+    let noProgressCount = 0 // 连续「同一批工具调用签名原样重试且无文本输出」的次数
+    let lastRoundSignature = '' // 上一轮工具调用的整体签名（#37）
     const recentToolSignatures: string[] = [] // 最近工具调用签名（检测死循环）
     // v0.6.155（#13）：记录本轮动作与最后一段文本——命中迭代上限时给出「已做/未做」清单，
     // 而不是一句「请简化你的请求」把长任务废掉（上下文其实都还在，能接着跑）。
@@ -373,18 +374,27 @@ export class Agent {
         const batchSignatures = new Set<string>()
         let abortRun = false
 
-        if (!response.content) {
-          noProgressCount++ // 工具调用没有伴随文本输出，算"无进展"
+        // #37：无进展判定改成「同一批工具调用签名原样重试」。
+        // 旧版把「所有不带文本的工具调用」都算无进展，纯探索型任务（连续 read_file /
+        // grep 翻代码，每次参数都不同）跑到第 15 轮被误杀——实测 33 秒中止，任务书里
+        // 还有大半没干。真正卡死的特征是「参数一字不改地重试」，换参数就是有新动作。
+        const roundSignature = allCalls
+          .map(tc => `${tc.function.name}:${tc.function.arguments || ''}`)
+          .sort()
+          .join('\u0001')
+        if (response.content) {
+          noProgressCount = 0
+        } else if (roundSignature === lastRoundSignature) {
+          noProgressCount++
         } else {
           noProgressCount = 0
         }
+        lastRoundSignature = roundSignature
 
-        // 宽松无进展保护：探索型任务（连续读文件收集信息）允许较多次
-        // 无文本工具调用，只有超过 15 次才强制停止
-        if (noProgressCount >= 15) {
+        if (noProgressCount >= 6) {
           // #25：break 前必须补齐 tool 消息，否则下一条请求带 pending tool_calls → 400
-          this.backfillToolResults(allCalls, '连续多次工具调用均无文本进展，flare 已停止本轮；本条未执行。')
-          yield { type: 'error', content: '连续多次工具调用均无进展，已自动停止。请简化任务后重试。' }
+          this.backfillToolResults(allCalls, '连续多轮以完全相同的工具调用重试且无文本进展，flare 已停止本轮；本条未执行。')
+          yield { type: 'error', content: '连续多轮以完全相同的工具调用重试且无文本进展，已自动停止。上下文已保留，可换思路后 --continue 继续。' }
           break
         }
 
