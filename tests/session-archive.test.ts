@@ -86,7 +86,7 @@ describe('MemoryStore 会话归档', () => {
   it('老库迁移（v0.6.31）：旧 sessions 无 archived 列 → 打开时自动补列', () => {
     store.close()
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Database = require('better-sqlite3')
+    const { DatabaseSync: Database } = require('node:sqlite')
     const db = new Database(join(tempDir, 'test.db'))
     db.exec(`
       DROP TABLE IF EXISTS sessions;

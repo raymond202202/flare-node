@@ -294,7 +294,7 @@ describe('MemoryStore', () => {
     // 先关掉当前 store，手工建一个"老版本"库（usage_log 无 cache_read_tokens 等列）
     store.close()
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Database = require('better-sqlite3')
+    const { DatabaseSync: Database } = require('node:sqlite')
     const db = new Database(join(tempDir, 'test.db'))
     db.exec(`
       DROP TABLE IF EXISTS usage_log;

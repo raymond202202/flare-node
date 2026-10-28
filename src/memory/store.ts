@@ -5,7 +5,7 @@
  * 参考：Hermes 的 SQLite + FTS5 设计
  */
 
-import Database from 'better-sqlite3'
+import { DatabaseSync } from 'node:sqlite'
 import { join, dirname } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { config } from '../core/config.js'
@@ -105,17 +105,21 @@ export function deserializeContent(raw: string): Message['content'] {
 }
 
 export class MemoryStore {
-  private db: Database.Database
+  /** v0.6.163: 换 node:sqlite（Node 内置，去掉 27 MB native 依赖与 ABI 坑） */
+  private db: DatabaseSync
+  private closed = false
 
   constructor(dbPath?: string) {
     const path = dbPath || DB_PATH
-    // 自动创建父目录（better-sqlite3 不会自动建目录；支持任意外部路径如 ~/.pulse/pulse-ai.db）
+    // 自动创建父目录（node:sqlite 不会自动建目录；支持任意外部路径如 ~/.pulse/pulse-ai.db）
     try {
       const dir = dirname(path)
       if (dir && dir !== '.') mkdirSync(dir, { recursive: true })
     } catch { /* 目录创建失败不阻塞（DB 打开时会报错） */ }
     const isNew = !existsSync(path)
-    this.db = new Database(path)
+    this.db = new DatabaseSync(path)
+    // 保持 better-sqlite3 的默认行为：并发写入等 5 s 再报 SQLITE_BUSY
+    this.db.exec('PRAGMA busy_timeout = 5000')
     
     // 总是执行建表 + 迁移（CREATE TABLE IF NOT EXISTS 是幂等的，
     // migrate() 会为老库补充缺失的列）
@@ -364,7 +368,7 @@ export class MemoryStore {
        FROM sessions s
        WHERE s.archived = 1
        ORDER BY s.updated_at DESC LIMIT ?`
-    ).all(limit) as SessionRow[]
+    ).all(limit) as unknown as SessionRow[]
   }
 
   /** 更新会话标题（UPSERT：会话记录不存在时同时创建，避免 UPDATE 0 行） */
@@ -385,13 +389,18 @@ export class MemoryStore {
    * - 返回是否真的删除了会话记录（会话不存在返回 false）
    */
   deleteSession(sessionId: string): boolean {
-    const del = this.db.transaction((sid: string) => {
-      this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sid)
-      this.db.prepare('DELETE FROM usage_log WHERE session_id = ?').run(sid)
-      const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sid)
-      return res.changes > 0
-    })
-    return del(sessionId)
+    // node:sqlite 没有 .transaction() 高阶包装，手写 BEGIN/COMMIT/ROLLBACK（全项目仅此 1 处）
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId)
+      this.db.prepare('DELETE FROM usage_log WHERE session_id = ?').run(sessionId)
+      const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId)
+      this.db.exec('COMMIT')
+      return Number(res.changes) > 0
+    } catch (e) {
+      try { this.db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+      throw e
+    }
   }
 
   /**
@@ -566,7 +575,7 @@ export class MemoryStore {
        FROM sessions s
        WHERE s.archived = 0
        ORDER BY s.updated_at DESC LIMIT ?`
-    ).all(limit) as SessionRow[]
+    ).all(limit) as unknown as SessionRow[]
   }
 
   /** 保存持久记忆 */
@@ -598,7 +607,7 @@ export class MemoryStore {
     const q = (query || '').trim()
     if (!q) return 0
     const res = this.db.prepare('DELETE FROM memories WHERE content LIKE ?').run(`%${q}%`)
-    return res.changes
+    return Number(res.changes)
   }
 
   /** 记录一次 LLM 调用的 token 用量（v0.6.29 起支持缓存/成本附加字段） */
@@ -803,7 +812,7 @@ export class MemoryStore {
            WHERE memories_fts MATCH ?
            ORDER BY score ASC
            LIMIT ?`
-        ).all(`"${q.replace(/"/g, '""')}"`, limit) as (MemoryRow & { score: number })[]
+        ).all(`"${q.replace(/"/g, '""')}"`, limit) as unknown as (MemoryRow & { score: number })[]
         if (rows.length > 0) {
           return rows.map(({ score, ...m }) => m)
         }
@@ -814,7 +823,7 @@ export class MemoryStore {
     try {
       return this.db.prepare(
         'SELECT * FROM memories WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?'
-      ).all(`%${q}%`, limit) as MemoryRow[]
+      ).all(`%${q}%`, limit) as unknown as MemoryRow[]
     } catch {
       return []
     }
@@ -866,7 +875,7 @@ export class MemoryStore {
   getAllMemories(): MemoryRow[] {
     return this.db.prepare(
       'SELECT * FROM memories ORDER BY created_at DESC'
-    ).all() as MemoryRow[]
+    ).all() as unknown as MemoryRow[]
   }
 
   /** 按类型获取记忆（v0.6.25）：WHERE type = ? 过滤（如 preference 偏好 / note 笔记），
@@ -877,7 +886,7 @@ export class MemoryStore {
     // 同秒插入用自增 id 次级排序保证顺序确定（与 getRecentMessages v0.6.21 同模式）
     return this.db.prepare(
       'SELECT * FROM memories WHERE type = ? ORDER BY created_at DESC, id DESC LIMIT ?'
-    ).all(t, limit) as MemoryRow[]
+    ).all(t, limit) as unknown as MemoryRow[]
   }
 
   /** 读取运行时设置（key-value，如看图模型切换） */
@@ -899,7 +908,11 @@ export class MemoryStore {
   }
 
   close() {
-    this.db.close()
+    // better-sqlite3 的 close() 是幂等的；node:sqlite 重复 close 会抛 "database is not open"，
+    // 这里保持幂等语义（多处收尾/异常路径可能都调一次）
+    if (this.closed) return
+    this.closed = true
+    try { this.db.close() } catch { /* 已关闭，忽略 */ }
   }
 }
 

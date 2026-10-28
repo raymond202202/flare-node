@@ -21,16 +21,30 @@ cd "$PROJECT_DIR"
 npm run build --silent 2>/dev/null
 
 # 3. 创建安装目录
-mkdir -p "$INSTALL_DIR/dist"
 mkdir -p "$INSTALL_DIR/bin"
 
-# 4. 复制构建产物
-echo "📋 复制文件到 $INSTALL_DIR"
-cp -r "$PROJECT_DIR/dist/"* "$INSTALL_DIR/dist/"
-cp -r "$PROJECT_DIR/node_modules" "$INSTALL_DIR/node_modules" 2>/dev/null || true
-cp "$PROJECT_DIR/package.json" "$INSTALL_DIR/"
+# 3.1 前置检查：v0.6.163 起引擎用 Node 内置的 node:sqlite（Node ≥ 22.5，实测 24 稳定）
+NODE_OK=$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write((a>22||(a===22&&b>=5))?"1":"0")' 2>/dev/null || echo 0)
+if [ "$NODE_OK" != "1" ]; then
+  echo "❌ 需要 Node ≥ 22.5（node:sqlite 内置模块），当前：$(node -v 2>/dev/null || echo 未安装)"
+  exit 1
+fi
 
-# 5. 创建启动脚本
+# 4. 复制构建产物（先清空，避免旧编译产物残留成幽灵文件）
+echo "📋 复制文件到 $INSTALL_DIR"
+rm -rf "$INSTALL_DIR/dist"
+mkdir -p "$INSTALL_DIR/dist"
+cp -r "$PROJECT_DIR/dist/"* "$INSTALL_DIR/dist/"
+cp "$PROJECT_DIR/package.json" "$INSTALL_DIR/"
+cp "$PROJECT_DIR/package-lock.json" "$INSTALL_DIR/"
+
+# 5. 生产依赖：用 npm ci 装到 install 目录（不复制、不嵌套、不带 devDeps）
+#    旧写法 cp -r node_modules 在目标已存在时会塞出 node_modules/node_modules（实测 +126 MB）
+echo "📦 安装生产依赖..."
+rm -rf "$INSTALL_DIR/node_modules"
+( cd "$INSTALL_DIR" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund )
+
+# 6. 创建启动脚本
 cat > "$INSTALL_DIR/bin/flare" << 'WRAPPER'
 #!/usr/bin/env node
 import('../dist/cli/index.js').catch(e => {
@@ -40,10 +54,10 @@ import('../dist/cli/index.js').catch(e => {
 WRAPPER
 chmod +x "$INSTALL_DIR/bin/flare"
 
-# 6. 在 ~/.local/bin/ 创建软链
+# 7. 在 ~/.local/bin/ 创建软链
 ln -sf "$INSTALL_DIR/bin/flare" "$LOCAL_BIN/flare"
 
-# 7. 检查 PATH
+# 8. 检查 PATH
 case ":$PATH:" in
   *":$LOCAL_BIN:"*) ;;
   *)

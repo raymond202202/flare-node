@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { MemoryStore } from '../src/memory/store.js'
-import Database from 'better-sqlite3'
+import { DatabaseSync as Database } from 'node:sqlite'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = join(__dirname, '..', 'dist', 'cli', 'index.js')
