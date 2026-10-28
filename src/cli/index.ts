@@ -1850,13 +1850,14 @@ export function main() {
     .option('-m, --mcp <path>', 'MCP 服务器配置 JSON 文件路径（可选，v0.5.5；连接外部 MCP 服务器并入工具集）')
     .option('-c, --confirm-tools <names>', '需要用户确认的工具名（逗号分隔；默认 memory_save，传空串关闭确认门，v0.6.1）')
     .option('--confirm-timeout <ms>', '确认超时毫秒（默认 30000；宿主未在时限内回 confirm_result 按拒绝处理，v0.6.1）')
+    .option('--no-risk-confirm', '关闭命令级风险确认（v0.6.162）：默认命中 confirm 档风险规则会发 confirm 事件等宿主裁决；关闭后回到 v0.6.158 的「无人值守默认拒绝」。供无人值守脚本使用（GUI 不要关）')
     .option('--max-tokens <n>', '默认最大输出 token 数（chat 请求未指定时应用，v0.6.5）')
     .option('--temperature <n>', '默认采样温度 0~2（chat 请求未指定时应用，v0.6.5）')
     .option('--max-context-messages <n>', '默认上下文裁剪条数上限（chat 请求未指定时应用；0 = 不按条数裁剪，v0.6.17）')
     .option('--max-context-tokens <n>', '默认上下文裁剪 token 预算（chat 请求未指定时应用；超过则迭代前自动裁剪，v0.6.17）')
     .option('--context-summarize', '默认开启上下文压缩摘要（chat 请求未指定时应用；裁剪时把丢弃历史压缩成摘要消息，v0.6.19）')
     .option('--tool-output-policy <json>', '默认工具输出治理策略 JSON（chat 请求未指定时应用，如 {"maxOutputChars":800,"tailChars":300}；探索型留头尾/终端型留尾部/长度预算/省略标记可定制，v0.6.34）')
-    .action(async (options: { profile?: string; storage?: string; namespace?: string; mcp?: string; confirmTools?: string; confirmTimeout?: string; maxTokens?: string; temperature?: string; maxContextMessages?: string; maxContextTokens?: string; contextSummarize?: boolean; toolOutputPolicy?: string }) => {
+    .action(async (options: { profile?: string; storage?: string; namespace?: string; mcp?: string; confirmTools?: string; confirmTimeout?: string; riskConfirm?: boolean; maxTokens?: string; temperature?: string; maxContextMessages?: string; maxContextTokens?: string; contextSummarize?: boolean; toolOutputPolicy?: string }) => {
       const { startHostServer } = await import('../server.js')
       const fs = await import('fs/promises')
       let profile: Record<string, unknown> = {}
@@ -1896,6 +1897,7 @@ export function main() {
         ...(mcp.length > 0 ? { mcp: mcp as any } : {}),
         ...(confirmTools !== undefined ? { confirmTools } : {}),
         ...(options.confirmTimeout ? { confirmTimeoutMs: Number(options.confirmTimeout) } : {}),
+        ...(options.riskConfirm === false ? { riskConfirm: false } : {}),
         ...(options.maxTokens !== undefined ? { defaultMaxTokens: Number(options.maxTokens) } : {}),
         ...(options.temperature !== undefined ? { defaultTemperature: Number(options.temperature) } : {}),
         ...(options.maxContextMessages !== undefined ? { defaultMaxContextMessages: Number(options.maxContextMessages) } : {}),

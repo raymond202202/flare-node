@@ -16,6 +16,7 @@
 
 import { createInterface } from 'node:readline'
 import { createRequire } from 'node:module'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   Agent,
   createProvider,
@@ -41,6 +42,11 @@ import {
   type ConfirmDecision,
   type OllamaModelsResult,
   type ToolOutputPolicy,
+  // v0.6.162：命令级风险确认（风险规则 confirm 档）接线到宿主弹窗，与工具级确认门并列
+  setRiskConfirmer,
+  setRiskAllowanceStore,
+  type RiskConfirmInfo,
+  type RiskDecision,
 } from './index.js'
 
 // v0.6.136：detectProvider 上移到 core/models.ts（供 store/routing 复用，消除副本）；此处导入 + re-export 保持对外 API 不变
@@ -69,6 +75,9 @@ export interface HostServerOptions {
   confirmTools?: string[]
   /** 确认超时毫秒（v0.6.1，默认 30000）：宿主未在时限内回 confirm_result 按安全默认（deny）处理 */
   confirmTimeoutMs?: number
+  /** 命令级风险确认接线（v0.6.162，默认 true）：terminal 工具命中 confirm 档风险规则时，
+   *  向宿主发 confirm 事件等用户裁决；false = 不接线（保持 v0.6.158 起的「无人值守默认拒绝」行为）。 */
+  riskConfirm?: boolean
   /** 默认最大输出 token 数（v0.6.5）：chat 请求未指定 maxTokens 时应用（CLI --max-tokens） */
   defaultMaxTokens?: number
   /** 默认采样温度 0~2（v0.6.5）：chat 请求未指定 temperature 时应用（CLI --temperature） */
@@ -173,6 +182,55 @@ export function buildConfirmEvent(
     name: toolName,
     args: args || {},
     ...(description ? { description } : {}),
+  }
+}
+
+/** 风险确认事件用的伪工具名（v0.6.162）：宿主弹窗标题里显示「terminal」，说明里写清是哪条规则 */
+export const RISK_CONFIRM_TOOL_NAME = 'terminal'
+/** 风险确认事件 id 前缀（v0.6.162）：与工具级确认门的 `c_` 前缀区分，两套挂起表互不干扰 */
+export const RISK_CONFIRM_ID_PREFIX = 'r_'
+
+/**
+ * 构造风险确认事件（v0.6.162，纯函数可单测）。
+ *
+ * 复用工具级确认门的 `confirm` 事件通道（协议 1.0 不变，旧宿主无需改动即可弹出确认框）；
+ * 区别只在语义：这里确认的是「这条命令要不要执行」，粒度是风险规则 id，而不是工具调用。
+ * `args` 里带 command/rule/reason 供宿主展示与记录（宿主只显示键名也不影响判断，
+ * 真正的判断依据写在 `description` 里）。
+ */
+export function buildRiskConfirmEvent(sessionId: string, id: string, info: RiskConfirmInfo): ConfirmEvent {
+  const cmd = info.command.length > 240 ? `${info.command.slice(0, 240)}…` : info.command
+  const seg = info.segment && info.segment.trim() !== info.command.trim()
+    ? (info.segment.length > 120 ? `\n命中片段：${info.segment.slice(0, 120)}…` : `\n命中片段：${info.segment}`)
+    : ''
+  return {
+    type: 'confirm',
+    sessionId,
+    id,
+    name: RISK_CONFIRM_TOOL_NAME,
+    args: { command: info.command, rule: info.rule, reason: info.reason || '' },
+    description: `⚠️ 风险命令（规则 ${info.rule}）：${info.reason}\n命令：${cmd}${seg}`,
+  }
+}
+
+/**
+ * 宿主确认决策 → 风险决策（v0.6.162，纯函数可单测）。
+ *
+ * 两个枚举值域本来一致（allow_once/allow_session/always/deny/alternative），
+ * 但两端是各自独立的类型，显式映射而不是强制转换：未知值一律按 deny（安全默认）。
+ */
+export function mapHostRiskDecision(decision: string): RiskDecision {
+  switch (decision) {
+    case 'allow_once':
+      return 'allow_once'
+    case 'allow_session':
+      return 'allow_session'
+    case 'always':
+      return 'always'
+    case 'alternative':
+      return 'alternative'
+    default:
+      return 'deny'
   }
 }
 
@@ -286,6 +344,9 @@ const ctxOptsChanged = (a?: CtxChatOpts, b?: CtxChatOpts): boolean =>
   // 策略是对象：JSON 序列化比较（validateToolOutputPolicy 归一化后字段顺序固定，稳定可复现）
   JSON.stringify(a?.toolOutputPolicy ?? null) !== JSON.stringify(b?.toolOutputPolicy ?? null)
 
+/** 风险确认事件的会话上下文（v0.6.162）：RiskConfirmer 签名不带 sessionId，用 AsyncLocalStorage 继承 */
+const riskSessionAls = new AsyncLocalStorage<string>()
+
 /** 启动宿主协议服务（阻塞读 stdin） */
 export function startHostServer(opts: HostServerOptions) {
   const { profile, storage, toolTimeoutMs = 30000, namespace } = opts
@@ -301,6 +362,9 @@ export function startHostServer(opts: HostServerOptions) {
   const gates = new Map<string, ConfirmationGate>()
   // 挂起的确认请求：confirm 事件发出后等待宿主 confirm_result
   const pendingConfirms = new Map<string, { resolve: (d: ConfirmDecision) => void; timer: NodeJS.Timeout }>()
+  // 命令级风险确认挂起表（v0.6.162）：与 pendingConfirms 分开——两套 id 前缀（c_/r_）+ 两套决策类型，
+  // 混用一张表会让工具确认与风险确认串线（例如工具确认的 deny 落到风险规则上）
+  const riskPending = new Map<string, { resolve: (d: RiskDecision) => void; timer: NodeJS.Timeout }>()
   // 工具描述（v0.6.27）：confirm 事件带工具描述（宿主弹窗可展示「AI 想做什么」）；getAgent 构建工具集时填充
   const toolDescriptions = new Map<string, string>()
   // MCP 管理器（v0.5.5）：外部 MCP 服务器工具并入 Agent 工具集
@@ -335,6 +399,37 @@ export function startHostServer(opts: HostServerOptions) {
       pendingConfirms.set(id, { resolve, timer })
       reply(buildConfirmEvent(sessionId, id, toolName, args, description))
     })
+  }
+
+  /**
+   * 向宿主发起风险确认（v0.6.162）：terminal 工具命中 confirm 档规则时发 confirm 事件等用户裁决。
+   *
+   * 为什么需要它：`risk.ts` 的 `setRiskConfirmer` 此前只在 `src/cli/index.ts` 接线。
+   * 宿主（GUI）起的是 `flare server`，没有确认器 → `tools/index.ts` 走「无人值守」分支。
+   * v0.6.158 起该分支已改为默认拒绝（不再是静默执行），但用户在 GUI 里只能看到一句
+   * 「命令未执行，去命令行加 --allow-risky」——既没法在界面上批准，也不知道是哪条命令被拦。
+   *
+   * 超时按 deny（安全默认）：宿主不响应/界面卡住时绝不自动放行不可逆操作。
+   */
+  const askHostRiskConfirm = (sessionId: string, info: RiskConfirmInfo): Promise<RiskDecision> => {
+    return new Promise((resolve) => {
+      const id = `${RISK_CONFIRM_ID_PREFIX}${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+      const timer = setTimeout(() => {
+        riskPending.delete(id)
+        resolve('deny')
+      }, confirmTimeoutMs + 5000)
+      timer.unref?.()
+      riskPending.set(id, { resolve, timer })
+      reply(buildRiskConfirmEvent(sessionId, id, info))
+    })
+  }
+
+  // 命令级风险确认接线（v0.6.162）：默认开启；opts.riskConfirm === false 时保持「无人值守默认拒绝」。
+  // 会话归属用 AsyncLocalStorage 传（RiskConfirmer 签名里没有 sessionId，chat 处理时 run(sessionId, …)），
+  // 并发多个会话时事件仍带对的那个 sessionId，不会把弹窗派到别的会话去。
+  if (opts.riskConfirm !== false) {
+    setRiskAllowanceStore(memoryStoreKv(storage ? new MemoryStore(storage) : getMemoryStore()))
+    setRiskConfirmer((info: RiskConfirmInfo) => askHostRiskConfirm(riskSessionAls.getStore() || 'default', info))
   }
 
   /** 会话确认门（v0.6.1，按 sessionId 缓存）：confirmer = 宿主弹窗（confirm 事件）；always 持久化到记忆库 settings 表 */
@@ -540,14 +635,17 @@ export function startHostServer(opts: HostServerOptions) {
           cancels.set(sessionId, flag)
           let sawDone = false
           try {
-            for await (const chunk of agent.run(String(req.input || ''))) {
-              if (flag.cancelled) {
-                reply({ type: 'cancelled', sessionId })
-                break
+            // v0.6.162：整个 run 放进会话上下文，风险确认器才能知道事件该带哪个 sessionId
+            await riskSessionAls.run(sessionId, async () => {
+              for await (const chunk of agent.run(String(req.input || ''))) {
+                if (flag.cancelled) {
+                  reply({ type: 'cancelled', sessionId })
+                  break
+                }
+                if ((chunk as any)?.type === 'done') sawDone = true
+                reply({ ...chunk, sessionId })
               }
-              if ((chunk as any)?.type === 'done') sawDone = true
-              reply({ ...chunk, sessionId })
-            }
+            })
           } catch (e: any) {
             // v0.6.154：引擎异常（工具抛错 / 模型调用失败 / 上下文超限）必须显式通知前端。
             // 旧版这里没有 catch，异常直接逃逸 —— 流断了但 done 帧永远不发，
@@ -1017,11 +1115,22 @@ export function startHostServer(opts: HostServerOptions) {
             break
           }
           const pendingConfirm = pendingConfirms.get(id)
-          if (!pendingConfirm) break // 未知/已超时的确认 id：静默忽略（不污染事件流）
-          clearTimeout(pendingConfirm.timer)
-          pendingConfirms.delete(id)
-          pendingConfirm.resolve(decision as ConfirmDecision)
-          break
+          if (pendingConfirm) {
+            clearTimeout(pendingConfirm.timer)
+            pendingConfirms.delete(id)
+            pendingConfirm.resolve(decision as ConfirmDecision)
+            break
+          }
+          // 风险确认（v0.6.162）：同一 confirm_result 通道回传，按挂起表分流——
+          // 决策枚举再映射一次（宿主只发 allow_once/deny 也兼容未来发 allow_session/always）
+          const pendingRisk = riskPending.get(id)
+          if (pendingRisk) {
+            clearTimeout(pendingRisk.timer)
+            riskPending.delete(id)
+            pendingRisk.resolve(mapHostRiskDecision(decision))
+            break
+          }
+          break // 未知/已超时的确认 id：静默忽略（不污染事件流）
         }
         case 'confirm_status': {
           // 宿主查询确认门状态（v0.6.8）：放行名单（会话级 + always 持久化）+ 当前确认名单配置（只读）

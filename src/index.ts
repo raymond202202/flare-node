@@ -190,7 +190,7 @@ export { memoryStoreKv } from './core/confirm.js'
 
 // ===== 宿主协议服务（Qt 等非 Node 宿主）=====
 // v0.6.136：detectProvider 已从 core/models.js 直接导出（server.ts re-export 保持兼容，此处不再重复）
-export { startHostServer, wrapConfirmTools, DEFAULT_CONFIRM_TOOLS, collectModelInfo, describeTools, buildConfirmEvent } from './server.js'
+export { startHostServer, wrapConfirmTools, DEFAULT_CONFIRM_TOOLS, collectModelInfo, describeTools, buildConfirmEvent, buildRiskConfirmEvent, mapHostRiskDecision, RISK_CONFIRM_TOOL_NAME, RISK_CONFIRM_ID_PREFIX } from './server.js'
 export type { HostServerOptions, ModelEndpointInfo, ModelInfoResponse, ToolMeta, ToolSourceSets, ConfirmEvent } from './server.js'
 
 // ===== 命令风险分级（v0.6.155）：block / confirm / safe 三档 + shell 分段判定 =====
