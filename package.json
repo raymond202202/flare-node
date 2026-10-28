@@ -1,6 +1,6 @@
 {
   "name": "flare-agent",
-  "version": "0.6.159",
+  "version": "0.6.160",
   "description": "Flare — Let your inspiration flare. 让你的灵感燃起来。通用能力 AI Agent：不局限于编程，可嵌入其他产品（如桌面应用 AI 面板）。",
   "type": "module",
   "main": "./dist/index.js",

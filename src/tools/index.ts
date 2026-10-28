@@ -6,7 +6,7 @@
  */
 
 import { ToolDefinition } from '../core/llm.js'
-import { spawn } from 'child_process'
+import { spawn, spawnSync, execFileSync } from 'child_process'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync, mkdirSync, openSync, closeSync, unlinkSync } from 'fs'
 import { resolve, join, dirname } from 'path'
 import { memorySearchTool, memorySaveTool } from './memory.js'
@@ -124,6 +124,57 @@ function isProtectedPath(path: string): boolean {
 }
 
 /**
+ * #36（v0.6.160）：写入后的轻量语法自检。
+ *
+ * 文档记录：write_file 写坏的 .py 要等到「下一步跑起来」才暴露，中间白烧几轮工具调用；
+ * 而语法错误本可以在写入当刻就报出来。这里对常见脚本/数据格式做零副作用检查
+ * （python 用 ast.parse，不生成 __pycache__），检查不通过不影响文件已落盘的事实，
+ * 只是把错误和行号立刻交给模型。
+ */
+function checkSyntaxAfterWrite(filePath: string, content: string): string {
+  const lower = filePath.toLowerCase()
+  const kb = Buffer.byteLength(content, 'utf-8') / 1024
+  if (kb > 1024) return '' // 超大文件跳过，避免拖慢写入
+  // #38（v0.6.160）：改用顶部 ESM import。原写法 `require('node:child_process')` 在 ESM 产物里
+  // 会抛 "require is not defined"，写入直接失败（vitest 有 CJS interop 所以测不出来，生产才炸）
+  const run = (cmd: string, args: string[]): { ok: boolean; msg: string } | null => {
+    try {
+      const r = spawnSync(cmd, args, { encoding: 'utf-8', timeout: 5000 })
+      if (r.error) return null // 工具不存在：静默跳过
+      if (r.status === 0) return { ok: true, msg: '' }
+      const detail = ((r.stderr || '') + (r.stdout || '')).trim().split('\n').slice(0, 6).join('\n')
+      return { ok: false, msg: detail || `退出码 ${r.status}` }
+    } catch {
+      return null
+    }
+  }
+  const report = (label: string, r: { ok: boolean; msg: string } | null): string => {
+    if (!r) return ''
+    return r.ok ? `\n语法自检通过（${label}）` : `\n⚠️ 语法自检未通过（${label}），文件已按原样落盘，请修正后重写：\n${r.msg}`
+  }
+
+  if (lower.endsWith('.json')) {
+    try {
+      JSON.parse(content)
+      return report('JSON.parse', { ok: true, msg: '' })
+    } catch (e: any) {
+      return report('JSON.parse', { ok: false, msg: String(e?.message || e) })
+    }
+  }
+  if (lower.endsWith('.py')) {
+    const code = 'import ast,sys\ntry:\n    ast.parse(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1])\nexcept SyntaxError as e:\n    print(f"{e.msg} (line {e.lineno}, col {e.offset})"); sys.exit(1)'
+    return report('python3 ast.parse', run('python3', ['-c', code, filePath]))
+  }
+  if (/(\.sh|\.bash)$/.test(lower)) {
+    return report('bash -n', run('bash', ['-n', filePath]))
+  }
+  if (/(\.m?js|cjs)$/.test(lower)) {
+    return report('node --check', run('node', ['--check', filePath]))
+  }
+  return ''
+}
+
+/**
  * 写入文件工具
  */
 export const writeFileTool: Tool = {
@@ -163,7 +214,8 @@ export const writeFileTool: Tool = {
         try { unlinkSync(tmpPath) } catch { /* 临时文件可能没建起来 */ }
         throw e
       }
-      return { success: true, output: `已写入 ${resolvedPath}` }
+      const syntaxNote = checkSyntaxAfterWrite(resolvedPath, args.content)
+      return { success: true, output: `已写入 ${resolvedPath}${syntaxNote}` }
     } catch (e: any) {
       return { success: false, output: '', error: `写入失败: ${e.message}` }
     }
@@ -435,7 +487,7 @@ function spillOutput(body: string): string | null {
  */
 function describeFailureAttribution(command: string): { errorNote: string; outputNote: string } {
   if (!command || typeof command !== 'string') return { errorNote: '', outputNote: '' }
-  let segs: Array<{ name: string; sepBefore: string }>
+  let segs: Array<{ raw: string; name: string; sepBefore: string }>
   try {
     segs = parseCommandSegments(command).filter((s) => (s.raw || '').trim().length > 0)
   } catch {
@@ -455,10 +507,80 @@ function describeFailureAttribution(command: string): { errorNote: string; outpu
     ? '；注意 `$?` 在管道里取的是末端命令的退出码，不是被测命令的——用 `${PIPESTATUS[0]}`'
     : ''
 
+  // #35（v0.6.160）：只给方法不给命令，模型仍要自己拼——直接列出可复制的逐段复查命令。
+  // 段数过多时截断（避免提示本身把上下文吃掉）。
+  const quoteSeg = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+  const listed = segs.slice(0, 8)
+  const checklist = listed
+    .map((s, i) => {
+      const one = s.raw.replace(/\s+/g, ' ').trim().slice(0, 70)
+      return `  ${i + 1}. ${one}${one.length >= 70 ? '…' : ''}\n     → bash -c ${quoteSeg(s.raw)}; echo "rc=$?"`
+    })
+    .join('\n')
+  const moreNote = segs.length > listed.length ? `\n  （其余 ${segs.length - listed.length} 段略）` : ''
+  const checklistNote = `\n逐段复查（逐条粘贴执行，带副作用的段看清楚再跑）：\n${checklist}${moreNote}`
+
   return {
     errorNote: `。复合命令共 ${segs.length} 段（${names}），${why}。${hint}${dollarNote}`,
-    outputNote: `\n\n[复合命令归因] 本条命令由 ${segs.length} 段组成（${names}）。${why}。${hint}${dollarNote}。`,
+    outputNote: `\n\n[复合命令归因] 本条命令由 ${segs.length} 段组成（${names}）。${why}。${hint}${dollarNote}。${checklistNote}\n（也可加 traceRc:true 让工具逐段重跑并直接报各段退出码）`,
   }
+}
+
+/**
+ * #34（v0.6.160）：语义化退出码。
+ *
+ * 有些命令的「非零」是业务结论而不是失败：`ferry translate` 用 2 表示「近似等价、需人工确认」，
+ * 3 表示「无等价实现」；`grep`/`diff` 的 1 表示「没匹配到/有差异」。工具层一律当失败报，
+ * 模型就会去「修」本来正确的东西（文档 #34 实测：为此多烧了十几轮）。
+ * 这里在错误文案里点名语义，并提示用 expectRc 声明。
+ */
+function describeSemanticExitCode(command: string, code: number | null): string {
+  if (code === null || code === 0) return ''
+  const isFerry = /\bferry\b[^\n]*\btranslate\b|\bferry\b[^\n]*\btranslate-command\b/.test(command)
+  if (isFerry && (code === 2 || code === 3)) {
+    return `\n注意：ferry translate 的退出码 ${code} 是业务语义（${code === 2 ? '近似等价，需人工确认' : '无等价实现'}），不是执行失败。`
+      + `这属于调用方预期内的结论，用 terminal(expectRc: [${code}]) 重跑即可拿到正常返回，不要为此改代码。`
+  }
+  if (code === 1 && /(^|[|&;(]\s*)(grep|egrep|fgrep|diff|test|\[)\b/.test(command)) {
+    return '\n注意：退出码 1 对 grep（无匹配）/ diff（有差异）/ test（条件为假）是正常结论，不是执行失败。'
+      + '需要继续时用 terminal(expectRc: [0,1]) 重跑。'
+  }
+  return ''
+}
+
+/**
+ * #35（v0.6.160）：复合命令失败后的逐段退出码实测。
+ *
+ * 只在模型显式要求时（traceRc:true）执行，因为会真实重跑每一段（可能产生副作用）。
+ * 有风险的段（confirm/block 档）一律跳过并说明，避免为了定位而把危险操作跑第二遍。
+ */
+async function traceSegments(command: string, timeoutMs: number): Promise<string> {
+  let segs
+  try {
+    segs = parseCommandSegments(command).filter((s) => (s.raw || '').trim().length > 0)
+  } catch {
+    return '\n\n[逐段复查] 命令无法静态拆分，跳过。'
+  }
+  if (segs.length <= 1) return '\n\n[逐段复查] 单段命令，退出码即该段结果，无需拆分。'
+
+  const lines: string[] = ['', '', '[逐段复查] 各段单独重跑（真实执行；风险段已跳过）：']
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i]
+    const label = seg.raw.replace(/\s+/g, ' ').trim().slice(0, 80)
+    let verdict
+    try { verdict = classifyCommand(seg.raw) } catch { verdict = { level: 'confirm' as const, reason: '无法判定' } }
+    if (verdict.level !== 'safe') {
+      lines.push(`  ${i + 1}. ${label} → 跳过（风险等级 ${verdict.level}${verdict.reason ? `：${verdict.reason}` : ''}）`)
+      continue
+    }
+    const rr = await runForeground(seg.raw, timeoutMs)
+    const tail = (rr.stdout + rr.stderr).trim().replace(/\s+$/g, '')
+    const tailOne = tail ? ` | 输出尾部：${tail.slice(-160).replace(/\n/g, ' ⏎ ')}` : ''
+    lines.push(`  ${i + 1}. ${label} → rc=${rr.timedOut ? `${rr.code ?? 'null'}（超时）` : rr.code}${tailOne}`)
+  }
+  const firstFail = lines.findIndex((l) => /rc=(?!0\b)/.test(l))
+  if (firstFail >= 0) lines.push(`  ⇒ 最早失败的段是上面标 rc≠0 的那一条（紧邻的下一段可能只是被前段短路没执行）。`)
+  return lines.join('\n')
 }
 
 /** #35：无人值守模式下放行 confirm 档的唯一开关（显式、可审计） */
@@ -486,7 +608,8 @@ function describePortConflict(body: string, command: string): { errorNote: strin
   push(command.match(/[:=](\d{4,5})\b/))
   push(command.match(/(?:^|\s)(\d{4,5})(?=\s|$)/))
 
-  const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+  // #38（v0.6.160）：同上，ESM 产物里不能用 require，否则端口占用诊断一触发就抛错、
+  // 真正的报错原因被 "require is not defined" 顶掉
   const ssPort = (p: string) => execFileSync('ss', ['-ltnp', `sport = :${p}`], { encoding: 'utf-8', timeout: 3000 })
     .trim().split('\n').filter((l) => l.trim())
   let port: string | undefined
@@ -537,12 +660,21 @@ export const terminalTool: Tool = {
           command: { type: 'string', description: '要执行的命令' },
           timeout: { type: 'number', description: '超时时间（秒，默认30）。超时先发 SIGINT、2 秒后 SIGKILL，并完整返回超时前已产生的输出' },
           background: { type: 'boolean', description: '后台执行：不等待命令结束，立即返回 PID 和日志路径。用于启动服务、守护进程、nohup、长任务' },
+          expectRc: {
+            type: 'array',
+            items: { type: 'number' },
+            description: '把哪些非零退出码视为正常结果（如 grep 无匹配的 1、ferry translate 的 2/3）。命中的退出码不报错，输出原样返回',
+          },
+          traceRc: {
+            type: 'boolean',
+            description: '复合命令失败后定位用：把各段单独重跑一次并报告每段退出码。会真实重复执行（风险段自动跳过），仅在需要定位失败段时使用',
+          },
         },
         required: ['command'],
       },
     },
   },
-  execute: (async (args: { command: string; timeout?: number; background?: boolean }) => {
+  execute: (async (args: { command: string; timeout?: number; background?: boolean; expectRc?: number[]; traceRc?: boolean }) => {
     try {
       // ── 风险分级（v0.6.155，#15/#16）：block 硬拦 / confirm 需确认 / safe 直接跑 ──
       const verdict = classifyCommand(args.command)
@@ -661,16 +793,35 @@ export const terminalTool: Tool = {
           error: `命令超时（${timeoutSec}s）${r.forceKilled ? '，SIGINT 无效已 SIGKILL 强杀' : '，已发 SIGINT'}。以下是超时前已产生的输出（${body.length} 字符，未丢弃）。长时间任务请加 background: true。${spillNote}`,
         }
       }
+      // #34（v0.6.160）：调用方显式声明为「正常结果」的非零退出码——不算失败。
+      // 语义化退出码（grep 无匹配=1、ferry translate 2/3）被一律当失败报，是文档里
+      // 反复出现的错误归因来源；由调用方显式声明，既可靠又不放水。
+      const expectRc = Array.isArray(args.expectRc)
+        ? args.expectRc.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+        : []
+      if (r.code !== null && r.code !== 0 && expectRc.includes(r.code)) {
+        return {
+          success: true,
+          output: body
+            + `\n\n[退出码 ${r.code} 已按调用方声明视为正常结果（expectRc: [${expectRc.join(', ')}]），未按失败处理]`
+            + spillNote,
+        }
+      }
+
       if (r.code === null || r.code !== 0) {
         const codeDesc = r.code !== null ? `退出码 ${r.code}` : `被信号 ${r.signal ?? '未知'} 终止`
         // #26：复合命令只报一个退出码会把模型引向错误归因——`a && b | c` 的退出码
         // 只反映最后一段/管道末端，前段全成功也可能报 1，模型据此去改本来对的代码。
         const attribution = describeFailureAttribution(args.command)
         const portConflict = describePortConflict(body, args.command)
+        // #34：语义化退出码点名（ferry 2/3、grep/diff 1）
+        const semantic = describeSemanticExitCode(args.command, r.code)
+        // #35：显式要求时逐段重跑，直接给出各段退出码（超时不动，避免叠加等待）
+        const traceNote = args.traceRc && !r.timedOut ? await traceSegments(args.command, timeoutSec * 1000) : ''
         return {
           success: false,
-          output: body + selfKillWarn + attribution.outputNote + portConflict.outputNote,
-          error: `命令执行失败（${codeDesc}）${body ? '' : '：无输出'}${attribution.errorNote}${portConflict.errorNote}${spillNote}`,
+          output: body + selfKillWarn + attribution.outputNote + portConflict.outputNote + traceNote,
+          error: `命令执行失败（${codeDesc}）${body ? '' : '：无输出'}${attribution.errorNote}${portConflict.errorNote}${semantic}${spillNote}`,
         }
       }
       // gh 的「退出码 0 但实际失败」（#17）：gh 把 HTTP 错误写到输出里却正常退出，

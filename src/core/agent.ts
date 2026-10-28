@@ -309,7 +309,8 @@ export class Agent {
     const configuredMax = Number.isFinite(envMax) && envMax > 0
       ? envMax
       : (this.config.maxIterations || DEFAULT_MAX_ITERATIONS)
-    const maxIter = Math.max(1, Math.min(configuredMax, HARD_MAX_ITERATIONS))
+    let maxIter = Math.max(1, Math.min(configuredMax, HARD_MAX_ITERATIONS))
+    let graceUsed = false // #33：预算延长只给一次，避免变成无上限
     let noProgressCount = 0 // 连续「同一批工具调用签名原样重试且无文本输出」的次数
     let lastRoundSignature = '' // 上一轮工具调用的整体签名（#37）
     const recentToolSignatures: string[] = [] // 最近工具调用签名（检测死循环）
@@ -517,7 +518,27 @@ export class Agent {
         // #25：重复调用/死循环中止必须跳出整个 while —— 旧版这里的 break 只跳出 for，
         // 循环继续 → 带着半截 tool_calls 再发请求 → 上游 400，整轮报废。
         if (abortRun) break
-        if (iterations >= maxIter) budgetExhausted = true
+        // #33（v0.6.160）：上限不该只看次数。本轮若仍在产出有效变更（成功写文件 / 成功执行命令），
+        // 到达上限时自动延长一次预算，而不是把还在推进的任务硬砍（旧行为：一句「请简化你的请求」
+        // 把跑了半天的长任务判死，上下文全丢）。只延长一次，延长幅度 50%（至少 +10、上限 500）。
+        if (iterations >= maxIter) {
+          if (!graceUsed && hasProductiveProgress(turnActions)) {
+            graceUsed = true
+            const extended = Math.min(Math.max(maxIter + Math.ceil(maxIter / 2), maxIter + 10), HARD_MAX_ITERATIONS)
+            if (extended > maxIter) {
+              yield {
+                type: 'text',
+                content: `\n[预算延长] 已用满 ${iterations}/${maxIter} 次模型迭代，但本轮仍在持续产出有效变更，`
+                  + `自动延长到 ${extended} 次（只延长一次）。无需重新发起，继续完成当前任务。\n`,
+              }
+              maxIter = extended
+            } else {
+              budgetExhausted = true
+            }
+          } else {
+            budgetExhausted = true
+          }
+        }
       } else {
         // 没有工具调用，对话结束
         break
@@ -751,6 +772,21 @@ export function actionTarget(toolName: string, args: Record<string, any> | undef
     }
   }
   return ''
+}
+
+/**
+ * #33（v0.6.160）：判断本轮是否「仍在产出有效变更」——用于迭代上限的自动延长。
+ *
+ * 旧行为只看次数：跑到上限就报预算耗尽，哪怕最近几步全是成功的写文件和成功的命令执行。
+ * 这里取最近 10 次动作，成功写文件 / 成功执行命令 / 成功 patch ≥ 2 次即视为有推进
+ * （纯重复签名已被死循环检测拦掉，所以这里不必再判重）。只读不算推进，避免「一直在读但没干活」被续命。
+ */
+export function hasProductiveProgress(actions: TurnAction[]): boolean {
+  const recent = actions.slice(-10)
+  const productive = recent.filter(
+    (a) => a.ok && (a.name === 'write_file' || a.name === 'terminal' || a.name === 'patch'),
+  ).length
+  return productive >= 2
 }
 
 /**

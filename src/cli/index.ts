@@ -10,7 +10,7 @@
 import { Command } from 'commander'
 import { Agent, createProvider, getMemoryStore, config, tools, McpManager, estimateMessagesTokens, suggestTrim, ConfirmationGate, memoryStoreKv, wrapConfirmTools, describeTools, validateToolOutputPolicy, mcpContentToText, routeTaskModel, type AgentConfig, type McpServerStatus, type ConfirmDecision, type McpResourceRef, type McpResourceTemplateRef, type McpPromptRef, type McpResourceContents, type McpPromptResult, type McpCompletionResult, type McpCallResult, type McpToolRef, type ToolOutputPolicy, setRiskConfirmer, setRiskAllowanceStore, listRiskAllowed, allRuleIds, revokeRiskRule, allowRiskRule, type RiskDecision, type RiskConfirmInfo } from '../index.js'
 import chalk from 'chalk'
-import { execSync } from 'child_process'
+import { execSync, execFileSync } from 'child_process'
 import { createRequire } from 'module'
 import { readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
@@ -1647,7 +1647,8 @@ export function printResumeBriefing(sid: string, store: ReturnType<typeof getMem
       }
     }
     // 工作区状态：有未提交改动就点出来（续跑时最容易踩的就是"改了没提交/提交了没推"）
-    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+    // #38（v0.6.160）：ESM 产物里 require 不可用，这里原来静默抛错，导致续跑摘要永远
+    // 不显示工作区状态（被外层 catch 吞掉）。改用顶部 import
     const status = execFileSync('git', ['status', '--short'], { encoding: 'utf-8', timeout: 3000 })
       .trim().split('\n').filter((l: string) => l.trim())
     const head = execFileSync('git', ['log', '--oneline', '-1'], { encoding: 'utf-8', timeout: 3000 }).trim()
