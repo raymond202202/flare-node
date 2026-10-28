@@ -8,6 +8,7 @@
 import { Message, LLMProvider, createProvider, createVisionProvider, buildImageContent, parseAttachments, type ContentPart, type ToolDefinition } from './llm.js'
 import { createHash } from 'crypto'
 import { getToolDefinitions, executeTool, type Tool } from '../tools/index.js'
+import { resolveBudget, HARD_MAX_ITERATIONS } from './iteration-budget.js'
 import { getMemoryStore, MemoryStore } from '../memory/store.js'
 import { trimContextMessages, summarizeTrimmedMessages } from './context.js'
 import { truncateToolOutput, type ToolOutputPolicy } from './tool-output.js'
@@ -303,13 +304,9 @@ export class Agent {
     // v0.6.154：默认 30 → 50；硬上限 50 → 200（可用 FLARE_MAX_ITERATIONS 或配置覆盖）
     // 原因：30 次在真实多文件项目里会被"对抗工具缺陷"吃掉三分之一（见 FLARE问题记录.md #11），
     // 长任务被腰斩后用户只能重开会话、上下文全丢。上限提高后仍保留护栏，避免失控死循环。
-    const HARD_MAX_ITERATIONS = 500
-    const DEFAULT_MAX_ITERATIONS = 50
-    const envMax = Number.parseInt(process.env.FLARE_MAX_ITERATIONS || '', 10)
-    const configuredMax = Number.isFinite(envMax) && envMax > 0
-      ? envMax
-      : (this.config.maxIterations || DEFAULT_MAX_ITERATIONS)
-    let maxIter = Math.max(1, Math.min(configuredMax, HARD_MAX_ITERATIONS))
+    // #40（v0.6.161）：预算解析集中到 iteration-budget.ts —— 硬上限只留一份，NaN/0/负数一律回默认，
+    // 不再依赖 `||` 的隐式兜底（宿主传 "abc" 时曾静默变成默认值且无任何提示）。
+    let maxIter = resolveBudget(this.config.maxIterations)
     let graceUsed = false // #33：预算延长只给一次，避免变成无上限
     let noProgressCount = 0 // 连续「同一批工具调用签名原样重试且无文本输出」的次数
     let lastRoundSignature = '' // 上一轮工具调用的整体签名（#37）

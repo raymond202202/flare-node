@@ -313,6 +313,108 @@ interface Rule {
   match: (ctx: MatchCtx) => boolean
 }
 
+/* ===== v0.6.161 / #39：解释器内联脚本、系统关键路径写入的分级补齐 =====
+ *
+ * 起因：拿 44 条高危命令实测 classifyCommand，20 条被判 safe，分三类漏判：
+ *  1) 解释器内联脚本（bash -c / sh -c / python3 -c / perl -e / node -e）——
+ *     真正执行的代码在引号里，而 parseCommandSegments 只看得到 "bash" 这个命令名；
+ *  2) 写入系统关键文件（tee / sed -i / cp / truncate / 重定向 → /etc/sudoers、/dev/sda…）——
+ *     旧规则只拦「设备当输入」（dd if=/dev/zero of=/dev/sda），不拦「往关键文件里写」；
+ *  3) find -delete、chown -R、su、eval —— 破坏面与提权类，此前完全没有规则。
+ */
+
+/** 写进去就能摧毁系统或直接提权的路径 */
+const CRITICAL_WRITE_PATHS: RegExp[] = [
+  /^\/etc\/(?:sudoers|sudoers\.d\/.+)$/,
+  /^\/etc\/(?:passwd|shadow|gshadow|group|fstab|crypttab|ld\.so\.preload)$/,
+  /^\/boot\//,
+  /^\/dev\/(?:sd|hd|vd|nvme|mmcblk|mapper|md\d|dm-\d|disk\/)/,
+]
+
+/** 系统目录：改错了要花时间修，但不至于一写就废 → 确认即可 */
+const SENSITIVE_WRITE_PATHS: RegExp[] = [
+  /^\/etc\//,
+  /^\/usr\/(?:bin|sbin|lib|lib64)\//,
+  /^\/bin\//,
+  /^\/sbin\//,
+  /^\/lib(?:64)?\//,
+  /^\/(?:proc|sys)\//,
+]
+
+/** 会往目标路径写内容/改权限的命令 */
+const WRITE_COMMANDS = new Set([
+  'tee', 'cp', 'mv', 'install', 'truncate', 'dd', 'ln', 'rsync', 'shred', 'sed', 'chmod', 'chown', 'setfacl',
+])
+
+/** 提取一段命令「会写到哪些路径」：重定向目标 + 写类命令的路径参数 */
+function writeTargets(seg: CommandSegment): string[] {
+  const out: string[] = []
+  const push = (p: string) => {
+    const t = stripQuotes(p).trim()
+    if (t) out.push(t)
+  }
+  // 重定向目标。跳过 `2>&1` / `>&2` 这类 fd 操作。
+  const re = /(?:^|[^0-9<>])>>?\s*("[^"]*"|'[^']*'|[^\s;&|()<>]+)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(seg.raw)) !== null) {
+    if (/^[&\d]/.test(m[1])) continue
+    push(m[1])
+  }
+  if (!WRITE_COMMANDS.has(seg.name)) return out
+
+  if (seg.name === 'dd') {
+    const of = /\bof=("[^"]*"|'[^']*'|\S+)/.exec(seg.argText)
+    if (of) push(of[1])
+    return out
+  }
+  const t = tokens(seg.argText)
+  // sed 只有 -i 才写盘；`sed -n '1,10p' /etc/passwd` 是纯读
+  if (seg.name === 'sed' && !t.some((x) => /^-[a-zA-Z]*i/.test(x) || x === '--in-place')) return out
+  for (const x of t) {
+    if (x.startsWith('-') || x.includes('=')) continue
+    if (x.startsWith('/') || x.startsWith('~') || x.startsWith('$HOME') || x.startsWith('${HOME}')) push(x)
+  }
+  return out
+}
+
+/** find 的起始路径（第一个非选项/非谓词参数） */
+function findRoots(argText: string): string[] {
+  const out: string[] = []
+  for (const x of tokens(argText)) {
+    if (x.startsWith('-') || x.startsWith('!') || x.startsWith('(')) continue
+    if (x.includes('=')) continue
+    out.push(x)
+    break
+  }
+  return out
+}
+
+/** 解释器内联脚本正文（bash -c / sh -c / python -c / node -e / perl -e …）；无则 null */
+function inlineScriptOf(seg: CommandSegment): string | null {
+  if (!INTERPRETERS.has(seg.name)) return null
+  const m = /(?:^|\s)(?:-c|--command|-e|--eval|-E)\s+("[^"]*"|'[^']*'|\S+)/.exec(seg.argText)
+  if (!m) return null
+  const raw = stripQuotes(m[1]).trim()
+  return raw || null
+}
+
+/** 内联脚本里「一眼就是高危」的模式：分段解析看不出来，只能按文本匹配 */
+const INLINE_DESTRUCTIVE = new RegExp(
+  [
+    'rm\\s+-[a-zA-Z]*[rR][a-zA-Z]*[^\\n]*\\s(?:/|/\\*|~|\\$\\{?HOME)(?:\\s|["\');]|$)',
+    'dd\\s+[^\\n]*of=/dev/(?:sd|hd|vd|nvme|mmcblk)',
+    'mkfs(?:\\.|\\s)',
+    'shred\\s+/dev/(?:sd|hd|vd|nvme)',
+    '>\\s*/etc/(?:sudoers|passwd|shadow|shadow-)',
+    'chmod\\s+-R\\s+[0-7]{3,4}\\s+/',
+    ':\\s*\\(\\s*\\)\\s*\\{',
+  ].join('|'),
+)
+
+/** 内联脚本里「调用系统执行接口」的模式 → 至少确认一次 */
+const INLINE_EXEC_API =
+  /(?:os\.system|os\.popen|subprocess\.(?:run|call|check_call|check_output|Popen)|shutil\.rmtree|os\.remove|os\.unlink|child_process|(?:^|[^.\w])exec(?:Sync)?\s*\(|system\s*\(|eval\s*\(|Runtime\.getRuntime)/m
+
 const BLOCK_RULES: Rule[] = [
   {
     id: 'rm-recursive-root',
@@ -381,6 +483,42 @@ const BLOCK_RULES: Rule[] = [
       if (!prev) return false
       if (seg.sepBefore !== '|' && seg.sepBefore !== '&') return false
       return DOWNLOADERS.has(prev.name)
+    },
+  },
+  {
+    id: 'write-critical-system-path',
+    level: 'block',
+    reason: '向系统关键文件或块设备写入内容，会直接摧毁系统或提权（sudoers / passwd / shadow / boot / 磁盘）',
+    match: ({ seg }) => writeTargets(seg).some((t) => CRITICAL_WRITE_PATHS.some((re) => re.test(t))),
+  },
+  {
+    id: 'find-destructive-root',
+    level: 'block',
+    reason: 'find 配合 -delete / -exec rm 递归删除，起点是根或系统目录时不可恢复',
+    match: ({ seg }) =>
+      seg.name === 'find' &&
+      /(?:^|\s)(?:-delete|-exec\s+(?:rm|shred|unlink)|-ok\s+(?:rm|shred))(?:\s|$)/.test(seg.argText) &&
+      findRoots(seg.argText).some((p) => isForceRoot(p)),
+  },
+  {
+    id: 'chown-recursive-root',
+    level: 'block',
+    reason: '递归改根/系统目录/家目录的属主，会导致系统或用户无法登录（与 chmod -R 777 / 同级）',
+    match: ({ seg }) =>
+      seg.name === 'chown' &&
+      (hasShortFlag(seg.argText, 'R') || /--recursive\b/.test(seg.argText)) &&
+      tokens(seg.argText)
+        .filter((t) => !t.startsWith('-'))
+        .slice(1)
+        .some((p) => isForceRoot(p)),
+  },
+  {
+    id: 'inline-destructive-script',
+    level: 'block',
+    reason: '解释器内联脚本里藏着高危命令（bash -c / python -c 等），只看命令名看不出来',
+    match: ({ seg }) => {
+      const s = inlineScriptOf(seg)
+      return !!s && INLINE_DESTRUCTIVE.test(s)
     },
   },
 ]
@@ -536,6 +674,56 @@ const CONFIRM_RULES: Rule[] = [
     reason: 'deinit 会移除子模块工作区文件',
     match: ({ seg }) => seg.name === 'git' && tokens(seg.argText)[0] === 'submodule' && tokens(seg.argText).includes('deinit'),
   },
+  {
+    id: 'write-system-path',
+    level: 'confirm',
+    reason: '向系统目录写入文件（/etc、/usr/bin、/proc/sys…），改错要花时间修',
+    match: ({ seg }) => writeTargets(seg).some((t) => SENSITIVE_WRITE_PATHS.some((re) => re.test(t))),
+  },
+  {
+    id: 'find-delete-recursive',
+    level: 'confirm',
+    reason: 'find -delete / -exec rm 删除命中文件，不可恢复',
+    match: ({ seg }) =>
+      seg.name === 'find' &&
+      /(?:^|\s)(?:-delete|-exec\s+(?:rm|shred|unlink)|-ok\s+(?:rm|shred))(?:\s|$)/.test(seg.argText),
+  },
+  {
+    id: 'privilege-escalation',
+    level: 'confirm',
+    reason: '切换 root 或修改账号口令，会改变当前权限边界',
+    match: ({ seg }) =>
+      seg.name === 'su' || seg.name === 'passwd' || seg.name === 'chpasswd' || seg.name === 'visudo' || seg.name === 'sudoedit',
+  },
+  {
+    id: 'eval-dynamic',
+    level: 'confirm',
+    reason: 'eval / 命令替换把运行期字符串当代码执行，静态无法判定内容',
+    match: ({ seg }) => seg.name === 'eval' || (seg.dynamic && INTERPRETERS.has(seg.name)),
+  },
+  {
+    id: 'encoded-pipe-to-shell',
+    level: 'confirm',
+    reason: '把解码后的内容直接喂给 shell，等于执行一段不可读的脚本',
+    match: ({ segs, idx }) => {
+      const seg = segs[idx]
+      if (!INTERPRETERS.has(seg.name) || seg.sepBefore !== '|') return false
+      const prev = segs[idx - 1]
+      if (!prev) return false
+      return /\b(?:base64\s+(?:-d|--decode)|xxd\s+-r|openssl\s+enc\s+-d|gunzip|zcat|uudecode|bunzip2|xz\s+-d)\b/.test(
+        prev.raw,
+      )
+    },
+  },
+  {
+    id: 'inline-dangerous-api',
+    level: 'confirm',
+    reason: '内联脚本调用系统执行接口（os.system / subprocess / exec），实际行为由运行期字符串决定',
+    match: ({ seg }) => {
+      const s = inlineScriptOf(seg)
+      return !!s && INLINE_EXEC_API.test(s)
+    },
+  },
 ]
 
 /** 会话内放行的规则（内存）；持久放行走 store */
@@ -652,10 +840,39 @@ export function getRiskConfirmer(): RiskConfirmer | null {
  * 分级判定入口。
  * 顺序：block 规则优先（安全兜底），其次 confirm。
  */
-export function classifyCommand(command: string): RiskVerdict {
+export function classifyCommand(command: string, depth = 0): RiskVerdict {
   const segs = parseCommandSegments(command)
   if (!segs.length) return { level: 'safe' }
   const plain = segs.map((s) => s.raw).join('\n')
+
+  // #39：解释器内联脚本里的内容才是真正要执行的代码，先递归判一遍再走规则表。
+  // 否则 `bash -c "rm -rf /"`、`sh -c 'dd if=/dev/zero of=/dev/sda'` 都只会被当成
+  // 一条无害的 bash 命令放行。depth 上限防止 `bash -c "bash -c ..."` 无限递归。
+  let inlineVerdict: RiskVerdict | null = null
+  if (depth < 3) {
+    for (const seg of segs) {
+      const script = inlineScriptOf(seg)
+      if (!script) continue
+      const inner = classifyCommand(script, depth + 1)
+      if (inner.level === 'safe') continue
+      if (inner.level === 'block') {
+        return {
+          level: 'block',
+          rule: `${inner.rule}#inline`,
+          reason: `解释器内联脚本中含高危命令：${inner.reason}`,
+          segment: script.slice(0, 160),
+        }
+      }
+      if (!inlineVerdict) {
+        inlineVerdict = {
+          level: 'confirm',
+          rule: `${inner.rule}#inline`,
+          reason: `解释器内联脚本中含需确认的命令：${inner.reason}`,
+          segment: script.slice(0, 160),
+        }
+      }
+    }
+  }
 
   for (const rule of BLOCK_RULES) {
     for (let idx = 0; idx < segs.length; idx++) {
@@ -664,6 +881,8 @@ export function classifyCommand(command: string): RiskVerdict {
       }
     }
   }
+  // 内联脚本里的确认级命令：block 规则全过之后、普通 confirm 之前返回
+  if (inlineVerdict) return inlineVerdict
   for (const rule of CONFIRM_RULES) {
     for (let idx = 0; idx < segs.length; idx++) {
       if (rule.match({ seg: segs[idx], segs, idx, plain, input: command })) {

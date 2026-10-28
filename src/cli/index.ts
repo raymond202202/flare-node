@@ -11,6 +11,7 @@ import { Command } from 'commander'
 import { Agent, createProvider, getMemoryStore, config, tools, McpManager, estimateMessagesTokens, suggestTrim, ConfirmationGate, memoryStoreKv, wrapConfirmTools, describeTools, validateToolOutputPolicy, mcpContentToText, routeTaskModel, type AgentConfig, type McpServerStatus, type ConfirmDecision, type McpResourceRef, type McpResourceTemplateRef, type McpPromptRef, type McpResourceContents, type McpPromptResult, type McpCompletionResult, type McpCallResult, type McpToolRef, type ToolOutputPolicy, setRiskConfirmer, setRiskAllowanceStore, listRiskAllowed, allRuleIds, revokeRiskRule, allowRiskRule, type RiskDecision, type RiskConfirmInfo } from '../index.js'
 import chalk from 'chalk'
 import { execSync, execFileSync } from 'child_process'
+import { parseMaxIterations, DEFAULT_MAX_ITERATIONS, HARD_MAX_ITERATIONS } from '../core/iteration-budget.js'
 import { createRequire } from 'module'
 import { readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
@@ -35,7 +36,9 @@ export function resolveStartSession(
   return store.createSession('CLI 会话')
 }
 
-async function startInteractive(opts: { contextSummarize?: boolean; newSession?: boolean } = {}) {
+async function startInteractive(
+  opts: { contextSummarize?: boolean; newSession?: boolean; maxIterations?: number } = {},
+) {
   // 非 TTY（管道/重定向输入）下无法交互，友好提示而不是崩溃
   if (!process.stdin.isTTY) {
     console.error(chalk.red('❌ 交互模式需要在终端中运行（当前输入不是终端）。'))
@@ -144,6 +147,8 @@ async function startInteractive(opts: { contextSummarize?: boolean; newSession?:
     cfg.tools = wrapConfirmTools([...tools, ...mcpTools], gate, CLI_CONFIRM_TOOLS)
     // 上下文压缩摘要（v0.6.19）：--context-summarize 开启后裁剪把丢弃历史压缩成摘要（AI 保留话题连续性）
     if (opts.contextSummarize) cfg.contextSummarize = true
+    // #40：交互模式也吃 -m，不再「传了等于没传」
+    if (opts.maxIterations !== undefined) cfg.maxIterations = opts.maxIterations
     // v0.6.147：交互模式默认大上下文（200 条）+ 默认开摘要——修复长对话早期历史被 30 条默认裁剪丢弃
     //（用户反馈"多轮对话看不到历史记录"；老版本无裁剪所以可以；超长对话由摘要兜底保留话题）
     cfg.maxContextMessages = 200
@@ -1662,6 +1667,26 @@ export function printResumeBriefing(sid: string, store: ReturnType<typeof getMem
  * v0.6.155（#13）：接着最近一个会话续跑。
  * 与「重开会话重说一遍」的本质区别：历史工具结果都在上下文里，模型不必重跑已完成步骤。
  */
+/** #40（v0.6.161）：-m/--max-iterations 的统一解析。
+ *
+ * 修之前有两个坑：
+ *  1) 交互模式（`flare chat`/`flare` 不带 -q）根本没把 -m 传给 Agent，用户 `-m 200` 进交互
+ *     以为提高了预算，实际还是默认 50，只在撞上限时才隐约发现；
+ *  2) `parseInt` 不校验，`-m abc` → NaN 被 Agent 里的 `|| 默认值` 静默兜回 50，`-m 5000`
+ *     被悄悄削到 500，用户全程无提示。
+ * 现在：非正整数直接 exit 2 并给出正确用法；超硬上限明确告知；交互模式同样生效。
+ */
+function resolveMaxIterations(raw: string | undefined): number | undefined {
+  const parsed = parseMaxIterations(raw)
+  if (!parsed.ok) {
+    console.error(chalk.red(`❌ --max-iterations ${parsed.error}`))
+    console.error(chalk.gray(`   例：flare chat -q "..." -m 120（默认 ${DEFAULT_MAX_ITERATIONS}，硬上限 ${HARD_MAX_ITERATIONS}）`))
+    process.exit(2)
+  }
+  if (parsed.warning) console.error(chalk.yellow(`⚠️  --max-iterations ${parsed.warning}`))
+  return parsed.value
+}
+
 async function continueSession(maxIterations?: number, sessionId?: string) {
   const store = getMemoryStore()
   const all = store.getAllSessions()
@@ -1795,7 +1820,7 @@ export function main() {
     .description('与 Flare 对话')
     .option('-q, --query <text>', '单次查询模式，直接提问')
     .option('-i, --image <path>', '附带图片路径（可与 -q 一起用；也可在问题中直接写路径）')
-    .option('-m, --max-iterations <n>', '最大工具调用迭代次数（默认50，硬上限500；可用环境变量 FLARE_MAX_ITERATIONS 覆盖。撞上限时 flare 会给出本轮摘要 + flare chat --continue 续跑，v0.6.155）')
+    .option('-m, --max-iterations <n>', '最大工具调用迭代次数（默认50，硬上限500；可用环境变量 FLARE_MAX_ITERATIONS 覆盖。交互模式同样生效；非正整数直接报错 exit 2，超上限削到 500 并提示。撞上限时 flare 会给出本轮摘要 + flare chat --continue 续跑，v0.6.155 / v0.6.161）')
     .option('-s, --session <sessionId>', '续聊已有会话（单次查询追加到该会话历史；缺省新建「单次查询」会话；会话不存在 exit 1 不触发生成；已归档会话续聊给黄色提示不拦截 v0.6.129；v0.6.128）')
     .option('-n, --new', '强制新建会话（交互模式默认自动恢复最近会话，聊天记录保留在窗口中；v0.6.145）')
     .option('-c, --continue', '接着最近会话（或 --session 指定会话）续跑上一轮未完成的任务，不重跑已完成步骤（常配合 -m 提高本轮预算；v0.6.155）')
@@ -1803,16 +1828,16 @@ export function main() {
     .option('--allow-risky', '无人值守模式显式放行 confirm 档（rm -rf / git push 等不可逆操作）。不给则该类命令默认拒绝；等价 FLARE_ALLOW_RISKY=1（v0.6.158）')
     .action(async (options: { query?: string; image?: string; maxIterations?: string; session?: string; new?: boolean; contextSummarize?: boolean; continue?: boolean; allowRisky?: boolean }) => {
       if (options.allowRisky) process.env.FLARE_ALLOW_RISKY = '1'
-      const maxIter0 = options.maxIterations ? parseInt(options.maxIterations, 10) : undefined
+      const maxIter = resolveMaxIterations(options.maxIterations)
       if (options['continue']) {
-        await continueSession(maxIter0, options.session)
+        await continueSession(maxIter, options.session)
         return
       }
       if (options.query) {
-        const maxIter = options.maxIterations ? parseInt(options.maxIterations, 10) : undefined
         await runQuery(options.query, maxIter, options.image ? [options.image] : undefined, options.session)
       } else {
-        startInteractive({ contextSummarize: options.contextSummarize, newSession: !!options.new })
+        // #40：交互模式此前静默丢弃 -m，现在透传给 Agent
+        startInteractive({ contextSummarize: options.contextSummarize, newSession: !!options.new, maxIterations: maxIter })
       }
     })
 
