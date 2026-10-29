@@ -1,5 +1,11 @@
 # Flare 🔥
 
+> ## 📦 本仓已归档为 Node/TypeScript 历史存档
+>
+> **主线已迁移到 Go 引擎：[`raymond202202/flare`](https://github.com/raymond202202/flare)**
+> 用户侧不再需要 Node.js。本仓（原 `raymond202202/flare`，2026-10 改名为 `flare-node`）保留源码与历史，不再接受功能更新。
+> GUI 客户端见 [`raymond202202/flare-client`](https://github.com/raymond202202/flare-client)。
+
 > **Let your inspiration flare** — 让你的灵感燃起来。
 >
 > 🧠 **由 AI 构建** — 本项目由 AI 智能体（Hermes Agent by Nous Research）在人类指导下开发，并由 Flare 自身持续迭代进化。
